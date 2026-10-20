@@ -29,7 +29,7 @@
 			"type": "float",
 			"name": "Prediction time budget (ms)",
 			"description": "Max time spent predicting per click. Higher = finds longer saves on big windows, but may hitch on dense levels.",
-			"default": 6.0,
+			"default": 4.0,
 			"min": 1.0,
 			"max": 30.0
 		},
@@ -39,16 +39,10 @@
 			"description": "Let the ghost use orbs, pads, gravity portals and speed portals. Turn off if you see glitches with objects.",
 			"default": true
 		},
-		"show-indicator": {
-			"type": "bool",
-			"name": "Show on-screen indicator",
-			"description": "Shows the current buffer stage in the corner while in a level.",
-			"default": true
-		},
 		"debug-console": {
 			"type": "bool",
 			"name": "Debug console window",
-			"description": "Open a console window that logs every saved input. Needs a restart.",
+			"description": "Also open a separate Windows console with the same log as the in-game K panel. Needs a restart.",
 			"default": false
 		}
 	}
