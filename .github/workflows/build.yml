@@ -1,0 +1,49 @@
+name: Build Geode Mod
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "**"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Windows
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the mod
+        id: build
+        uses: geode-sdk/build-geode-mod@main
+        with:
+          bindings: geode-sdk/bindings
+          target: Win64
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Build Output
+          path: ${{ steps.build.outputs.build-output }}
+
+      - name: Read mod version
+        id: version
+        shell: pwsh
+        run: |
+          $v = (Get-Content mod.json -Raw | ConvertFrom-Json).version
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Publish release with .geode file
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: Predictive Input Buffer ${{ steps.version.outputs.version }}
+          body: |
+            Download the `.geode` file below and put it in your Geometry Dash `geode/mods` folder, then restart the game.
+          files: ${{ steps.build.outputs.build-output }}/*.geode
+          make_latest: true
