@@ -13,9 +13,10 @@
 //    so taps and hold lengths are preserved (no more swallowed clicks / 1-tick taps).
 //  - Time budget per click so big windows don't hitch.
 //  - Fixes: ghost lifetime, init using `this`, time-warp dt, F6 only when GD focused,
-//    dead flipGravity hook priority, optional console, on-screen stage label.
+//    dead flipGravity hook priority, optional console, K panel (stage + live log, hidden by default).
 
 #include <Geode/Geode.hpp>
+#include <Geode/modify/CCKeyboardDispatcher.hpp>
 #include <Geode/modify/EffectGameObject.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/GameObject.hpp>
@@ -37,6 +38,7 @@ using namespace geode::prelude;
 namespace {
     constexpr int HOOK_PRIORITY = -1000000;
     constexpr float TICK = 0.25f;
+    constexpr size_t PANEL_LINES = 8;
 
     constexpr uint64_t typeBit(GameObjectType type) {
         return 1ull << static_cast<int>(type);
@@ -117,7 +119,13 @@ namespace {
     struct Buffer {
         PlayerObject* ghost1 = nullptr;
         PlayerObject* ghost2 = nullptr;
-        CCLabelBMFont* label = nullptr;
+        CCLayer* ghostLayer = nullptr;
+
+        CCNode* panel = nullptr;
+        CCLabelBMFont* panelTitle = nullptr;
+        CCLabelBMFont* panelLog = nullptr;
+        bool panelOpen = false;  // closed by default, remembered for the session
+        std::deque<std::string> logLines;
 
         bool simulating = false;
         bool injecting = false;
@@ -147,23 +155,47 @@ namespace {
         std::vector<ObjSnapshot> snapshots;
     } buf;
 
+    std::string stageText();
+
+    // In-game panel (K): current stage + the same live log the console shows.
+    // Hidden by default; only touched when open, so it costs nothing while closed.
+    void refreshPanel() {
+        if (!buf.panel) {
+            return;
+        }
+        buf.panel->setVisible(buf.panelOpen);
+        if (!buf.panelOpen) {
+            return;
+        }
+        buf.panelTitle->setString(stageText().c_str());
+        std::string text = "F6: change stage    K: hide\n";
+        for (auto const& line : buf.logLines) {
+            text += line;
+            text += '\n';
+        }
+        buf.panelLog->setString(text.c_str());
+    }
+
+    // Log line -> in-game panel history, plus the Windows console if enabled.
+    // (Formatting a short string is cheap; it was the synchronous console writes
+    //  that hitched, and those still only happen with the console setting on.)
     template <class... Args>
     void say(fmt::format_string<Args...> f, Args&&... args) {
         auto msg = fmt::format(f, std::forward<Args>(args)...);
+        buf.logLines.push_back(msg);
+        while (buf.logLines.size() > PANEL_LINES) {
+            buf.logLines.pop_front();
+        }
         if (buf.console) {
             std::printf("[InputBuffer] %s\n", msg.c_str());
         }
-        log::info("{}", msg);
+        if (buf.panelOpen) {
+            refreshPanel();
+        }
     }
 
     bool isGhost(PlayerObject* p) {
         return p && (p == buf.ghost1 || p == buf.ghost2);
-    }
-
-    bool gdFocused() {
-        DWORD pid = 0;
-        GetWindowThreadProcessId(GetForegroundWindow(), &pid);
-        return pid == GetCurrentProcessId();
     }
 
     void resetPending() {
@@ -198,14 +230,6 @@ namespace {
             buf.ticksWave * TICK);
     }
 
-    void updateLabel() {
-        if (!buf.label) {
-            return;
-        }
-        buf.label->setVisible(Mod::get()->getSettingValue<bool>("show-indicator"));
-        buf.label->setString(stageText().c_str());
-    }
-
     void dropGhosts() {
         for (auto** g : { &buf.ghost1, &buf.ghost2 }) {
             if (*g) {
@@ -214,19 +238,38 @@ namespace {
                 *g = nullptr;
             }
         }
-        buf.label = nullptr;  // owned by the PlayLayer
+        if (buf.ghostLayer) {
+            buf.ghostLayer->removeAllChildrenWithCleanup(true);
+            buf.ghostLayer->release();
+            buf.ghostLayer = nullptr;
+        }
+        // panel nodes are owned by the PlayLayer
+        buf.panel = nullptr;
+        buf.panelTitle = nullptr;
+        buf.panelLog = nullptr;
         buf.simulating = false;
         buf.injecting = false;
         buf.rapid = 0;
         resetPending();
     }
 
+    // PERF: v1 created ghosts with the PlayLayer as their parent layer and put them in
+    // the object layer. PlayerObject::init adds ~13 particle systems, 2 motion streaks,
+    // a wave trail and a ghost trail to that parent layer, so every frame the game was
+    // updating and drawing two invisible players' worth of effects (which also kept
+    // emitting wherever the ghost was last simulated). Ghosts now live in a detached
+    // layer that is never added to the scene: cocos never visits/draws it and its
+    // nodes' scheduled updates stay paused, so the ghosts cost nothing between clicks.
     PlayerObject* makeGhost(PlayLayer* layer) {
-        auto* ghost = PlayerObject::create(1, 1, layer, layer, true);
+        if (!buf.ghostLayer) {
+            buf.ghostLayer = CCLayer::create();
+            buf.ghostLayer->retain();
+        }
+        auto* ghost = PlayerObject::create(1, 1, layer, buf.ghostLayer, true);
         ghost->retain();
         ghost->setPosition(CCPoint(0.f, 105.f));
         ghost->setVisible(false);
-        layer->m_objectLayer->addChild(ghost);
+        buf.ghostLayer->addChild(ghost);
         return ghost;
     }
 
@@ -361,8 +404,10 @@ namespace {
 
     // Returns ticks survived after the input (horizon = fully safe).
     // releaseAfter: ticks after the press at which the ghost lets go (-1 = hold).
+    // stopAt: stop as soon as this many ticks were survived (the caller already knows
+    // that's good enough), instead of always running the full horizon.
     int simulate(PlayLayer* layer, PlayerObject* p1, PlayerObject* p2, bool dual, int delay, bool down, int horizon, int releaseAfter,
-        SimEnd* end) {
+        int stopAt, SimEnd* end) {
         *end = SimEnd::Ok;
         if (!buf.ghost1) {
             return horizon;
@@ -435,6 +480,9 @@ namespace {
                 continue;
             }
             ++survived;
+            if (survived >= stopAt) {
+                break;
+            }
             if (flying) {
                 continue;
             }
@@ -478,7 +526,8 @@ namespace {
         int gain = 6;
         for (int k = 1; k <= maxDelay; ++k) {
             SimEnd end;
-            int ret = simulate(layer, p1, p2, dual, k, down, horizon, releaseAfter, &end);
+            // Reaching `target` always counts as good, so there's no need to simulate past it.
+            int ret = simulate(layer, p1, p2, dual, k, down, horizon, releaseAfter, std::min(target, horizon), &end);
             if (end == SimEnd::StopSearch) {
                 return 0;
             }
@@ -590,7 +639,7 @@ namespace {
         int releaseAfter = (down && !anyWave && !anyRobot) ? holdEstimate() : -1;
 
         SimEnd end;
-        int base = simulate(layer, p1, p2, dual, 0, down, horizon, releaseAfter, &end);
+        int base = simulate(layer, p1, p2, dual, 0, down, horizon, releaseAfter, horizon, &end);
         if (base >= horizon) {
             buf.appliedInput = down;
             return false;
@@ -603,8 +652,7 @@ namespace {
             return false;
         }
 
-        say("SAVED +{} ticks ({:g} frames) {}  (now: {} -> delayed: {})  [limit {}]", saved, saved * TICK, down ? "PRESS" : "RELEASE",
-            base, landed, maxDelay);
+        say("SAVED {} +{}t ({:g}f)  {}->{}  [max {}]", down ? "press" : "release", saved, saved * TICK, base, landed, maxDelay);
         buf.shift = saved;
         queueInput(saved, down);
         return true;
@@ -615,8 +663,8 @@ namespace {
         resetPending();
         applyStage();
         readSettings();
-        updateLabel();
         say("F6 -> {}", stageText());
+        refreshPanel();
     }
 
     void deliverPending(PlayLayer* layer, PlayerObject* player) {
@@ -698,15 +746,31 @@ class $modify(BufPlayLayer, PlayLayer) {
         buf.ghost1 = makeGhost(this);
         buf.ghost2 = makeGhost(this);
 
+        // K panel: hidden unless the player opens it.
+        constexpr float W = 250.f;
+        constexpr float H = 130.f;
         auto win = CCDirector::get()->getWinSize();
-        buf.label = CCLabelBMFont::create(stageText().c_str(), "bigFont.fnt");
-        buf.label->setScale(0.3f);
-        buf.label->setOpacity(150);
-        buf.label->setAnchorPoint({ 0.f, 1.f });
-        buf.label->setPosition({ 5.f, win.height - 5.f });
-        buf.label->setZOrder(1000);
-        this->addChild(buf.label);
-        updateLabel();
+        buf.panel = CCNode::create();
+        buf.panel->setPosition({ 5.f, win.height - H - 5.f });
+        buf.panel->setZOrder(1000);
+
+        auto* bg = CCLayerColor::create({ 0, 0, 0, 160 }, W, H);
+        buf.panel->addChild(bg);
+
+        buf.panelTitle = CCLabelBMFont::create("", "bigFont.fnt");
+        buf.panelTitle->setScale(0.35f);
+        buf.panelTitle->setAnchorPoint({ 0.f, 1.f });
+        buf.panelTitle->setPosition({ 6.f, H - 5.f });
+        buf.panel->addChild(buf.panelTitle);
+
+        buf.panelLog = CCLabelBMFont::create("", "chatFont.fnt");
+        buf.panelLog->setScale(0.5f);
+        buf.panelLog->setAnchorPoint({ 0.f, 1.f });
+        buf.panelLog->setPosition({ 6.f, H - 22.f });
+        buf.panel->addChild(buf.panelLog);
+
+        this->addChild(buf.panel);
+        refreshPanel();
 
         buf.realInput = false;
         buf.appliedInput = false;
@@ -776,27 +840,25 @@ class $modify(BufPlayerObject, PlayerObject) {
         (void)self.setHookPriority("PlayerObject::ringJump", HOOK_PRIORITY);
     }
 
+    // Runs 240x/sec per player. Ghost steps (during a simulation) skip straight to
+    // the original; F6 is no longer polled here (see BufKeyboard below).
     void update(float dt) {
-        if (!buf.simulating) {
-            auto* layer = GameManager::get()->m_playLayer;
-            if (layer && this == layer->m_player1) {
-                ++tickCount;
-                static bool f6Was = false;
-                bool f6 = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
-                if (f6 && !f6Was && gdFocused()) {
-                    cycleStage();
-                }
-                f6Was = f6;
-                if (buf.enabled) {
-                    deliverPending(layer, this);
-                }
+        if (buf.simulating) {
+            PlayerObject::update(dt);
+            return;
+        }
+        auto* layer = GameManager::get()->m_playLayer;
+        if (layer && this == layer->m_player1) {
+            ++tickCount;
+            if (buf.enabled) {
+                deliverPending(layer, this);
             }
         }
 
         PlayerObject::update(dt);
 
         // The ghost must step with exactly the dt the real player gets.
-        if (!buf.simulating && !isGhost(this) && dt > 0.f) {
+        if (dt > 0.f) {
             buf.tickLength = dt;
         }
     }
@@ -823,6 +885,23 @@ class $modify(BufPlayerObject, PlayerObject) {
             snapshotObject(ring);
         }
         PlayerObject::ringJump(ring, skipCheck);
+    }
+};
+
+// F6 via the game's own keyboard events: no polling, and it only fires while GD has
+// focus (v1 polled GetAsyncKeyState every physics tick, even when tabbed out).
+class $modify(BufKeyboard, CCKeyboardDispatcher) {
+    bool dispatchKeyboardMSG(enumKeyCodes key, bool isKeyDown, bool isKeyRepeat, double timestamp) {
+        if (isKeyDown && !isKeyRepeat && GameManager::get()->m_playLayer) {
+            if (key == KEY_F6) {
+                cycleStage();
+            }
+            else if (key == KEY_K) {
+                buf.panelOpen = !buf.panelOpen;
+                refreshPanel();
+            }
+        }
+        return CCKeyboardDispatcher::dispatchKeyboardMSG(key, isKeyDown, isKeyRepeat, timestamp);
     }
 };
 
@@ -861,26 +940,36 @@ class $modify(BufBaseGameLayer, GJBaseGameLayer) {
             relevant.reserve(objectCount);
         }
 
-        CCRect ghostRect = player->getObjectRect();
+        // Hot loop: runs for every nearby object, every ghost tick. One type lookup per
+        // object, no bounds-checked at(), and the ghost rect is only fetched if needed.
+        uint64_t keep = buf.smart ? (COLLIDING_TYPES | INTERACT_TYPES) : COLLIDING_TYPES;
+        bool haveRect = false;
+        CCRect ghostRect;
+        auto& list = *objects;
         for (int i = 0; i < objectCount; ++i) {
-            auto* object = objects->at(i);
+            auto* object = list[i];
             if (!object) {
                 continue;
             }
-            if (hasType(COLLIDING_TYPES, object)) {
+            auto type = static_cast<unsigned>(object->m_objectType);
+            uint64_t bit = type < 64 ? (1ull << type) : 0;
+            if (keep & bit) {
                 relevant.push_back(object);
                 continue;
             }
             if (!buf.smart) {
                 continue;
             }
-            if (hasType(INTERACT_TYPES, object)) {
-                relevant.push_back(object);
+            bool stop = (STOP_TYPES & bit) != 0;
+            float speed = stop ? 0.f : speedPortalValue(object->m_objectID);
+            if (!stop && speed <= 0.f) {
                 continue;
             }
-            bool stop = hasType(STOP_TYPES, object);
-            float speed = speedPortalValue(object->m_objectID);
-            if ((stop || speed > 0.f) && ghostRect.intersectsRect(object->getObjectRect())) {
+            if (!haveRect) {
+                ghostRect = player->getObjectRect();
+                haveRect = true;
+            }
+            if (ghostRect.intersectsRect(object->getObjectRect())) {
                 if (stop) {
                     buf.ghostHitPortal = true;
                 }
