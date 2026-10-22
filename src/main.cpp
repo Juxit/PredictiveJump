@@ -280,7 +280,35 @@ namespace {
         buf.injecting = false;
     }
 
+    // Captured "button held" / "button free" representation, copied verbatim from the
+    // real player each tick (see BufPlayerObject::update). Type-agnostic: whatever your
+    // bindings use for m_holdingButtons, we just copy the value, so no assumption about
+    // whether it's a scalar, bitmask or wrapper.
+    static decltype(PlayerObject::m_holdingButtons) g_heldState{};
+    static decltype(PlayerObject::m_holdingButtons) g_freeState{};
+    static bool g_haveHeld = false;
+    static bool g_haveFree = false;
+
+    // Drive the ghost's button state DIRECTLY instead of through pushButton /
+    // releaseButton. Those are the real input entry points, so every mod that hooks
+    // them (CPS counters, click sounds, jump counters, ...) was firing once per delay
+    // the search tested -- which is why CPS exploded in noclip, where no delay ever
+    // "wins" so the search runs to its full budget on every click. The jump itself is
+    // applied in PlayerObject::update() from these flags, so setting them is behaviour-
+    // identical for the ghost while being invisible to those hooks.
     void pressGhost(PlayerObject* ghost, bool down) {
+        if (down ? g_haveHeld : g_haveFree) {
+            ghost->m_holdingButtons = down ? g_heldState : g_freeState;
+            if (down) {
+                // Mirror the jump-buffer edge pushButton() would set (both fields are
+                // already synced in copyState(), so this only re-arms the press edge).
+                ghost->m_jumpBuffered = true;
+                ghost->m_stateJumpBuffered = true;
+            }
+            return;
+        }
+        // Not warmed up yet (no real input seen since load): fall back to the real
+        // calls for this one press. Happens at most until your first tap/hold.
         if (down) {
             ghost->pushButton(PlayerButton::Jump);
         }
@@ -860,6 +888,15 @@ class $modify(BufPlayerObject, PlayerObject) {
         // The ghost must step with exactly the dt the real player gets.
         if (dt > 0.f) {
             buf.tickLength = dt;
+        }
+
+        // Capture the game's own holding-button representation from the real player so
+        // the ghost can be driven without calling pushButton/releaseButton. We record
+        // both the "held" and "free" value as you play; by your first tap both exist.
+        if (layer && this == layer->m_player1) {
+            auto& slot = buf.realInput ? g_heldState : g_freeState;
+            slot = this->m_holdingButtons;
+            (buf.realInput ? g_haveHeld : g_haveFree) = true;
         }
     }
 
